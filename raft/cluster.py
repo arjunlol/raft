@@ -16,6 +16,10 @@ class RaftCluster:
         self.transport = InMemoryTransport()
         self.node_map: dict[str, RaftNode] = {}
 
+        if len(node_ids) % 2 == 0:
+            msg = "RaftCluster requires an odd number of nodes"
+            raise ValueError(msg)
+
         if state_machine_factory is None:
             state_machine_factory = DictStateMachine
 

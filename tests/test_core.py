@@ -105,3 +105,7 @@ class TestCluster:
             assert node_id not in node.peer_ids
             assert len(node.peer_ids) == 2
 
+    def test_even_number_of_nodes_rejected(self) -> None:
+        with pytest.raises(ValueError, match="odd number of nodes"):
+            RaftCluster(["n1", "n2", "n3", "n4"])
+
