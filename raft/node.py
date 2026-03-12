@@ -175,14 +175,27 @@ class RaftNode:
             return
 
         if isinstance(message, RequestVote):
-            # Grant vote if we have not already voted this term or
-            # we are voting again for the same candidate.
+            # A follower grants its vote to a candidate only if **all** of:
+            # 1) the candidate's term is at least as large as ours,
+            # 2) we have not yet voted in this term (or we vote again for the same candidate),
+            # 3) the candidate's log is at least as up-to-date as our own log.
             vote_granted = False
 
             if message.term < self.current_term:
                 vote_granted = False
             else:
-                if self.voted_for is None or self.voted_for == message.candidate_id:
+                candidate_log_at_least_up_to_date_as_follower = (
+                    message.last_log_term > self.log.last_term
+                    or (
+                        message.last_log_term == self.log.last_term
+                        and message.last_log_index >= self.log.last_index
+                    )
+                )
+
+                if (
+                    candidate_log_at_least_up_to_date_as_follower
+                    and (self.voted_for is None or self.voted_for == message.candidate_id)
+                ):
                     self.voted_for = message.candidate_id
                     vote_granted = True
 

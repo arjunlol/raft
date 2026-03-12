@@ -4,6 +4,8 @@ from collections import defaultdict
 import pytest
 
 from raft.cluster import RaftCluster
+from raft.log import LogEntry
+from raft.messages import RequestVote, RequestVoteResponse
 from raft.node import Role
 
 
@@ -131,6 +133,43 @@ class TestElection:
         # No term should have more than one leader in this snapshot.
         for term, leader_ids in leaders_by_term.items():
             assert len(leader_ids) == 1, f"term {term} has leaders {leader_ids}"
+
+        await cluster.stop()
+
+    async def test_follower_refuses_vote_when_candidate_log_less_up_to_date(self) -> None:
+        """A follower must not grant a vote if the candidate's log is not at least as up-to-date as its own."""
+        cluster = RaftCluster(["n1", "n2", "n3"])
+        transport = cluster.transport
+
+        # Give n1 (follower) a more up-to-date log: one entry at term 1, index 1.
+        n1 = cluster.node_map["n1"]
+        n1.log.append(LogEntry(term=1, index=1, command="x"))
+        n1.current_term = 2
+        n1.voted_for = None
+
+        # Only start n1 so it runs the follower loop and we can inject a RequestVote.
+        await n1.start()
+
+        # Candidate n2 has empty log (last_log_index=0, last_log_term=0).
+        request = RequestVote(
+            term=2,
+            candidate_id="n2",
+            last_log_index=0,
+            last_log_term=0,
+            sender="n2",
+        )
+        await transport._node_queues_map["n1"].put(request)
+
+        # Follower's response goes to the candidate's queue.
+        response: RequestVoteResponse = await asyncio.wait_for(
+            transport._node_queues_map["n2"].get(),
+            timeout=1.0,
+        )
+
+        assert response.term == 2
+        assert response.vote_granted is False, (
+            "follower must not grant vote when candidate's log is less up-to-date"
+        )
 
         await cluster.stop()
 
