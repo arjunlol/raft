@@ -1,7 +1,7 @@
 import asyncio
 import enum
 import random
-from typing import Optional
+from typing import Any, Optional
 
 from raft.messages import (
     AppendEntries,
@@ -10,7 +10,7 @@ from raft.messages import (
     RequestVote,
     RequestVoteResponse,
 )
-from raft.log import Log
+from raft.log import Log, LogEntry
 from raft.state_machine import StateMachine
 from raft.transport import InMemoryTransport
 
@@ -19,6 +19,10 @@ class Role(enum.Enum):
     FOLLOWER = "follower"
     CANDIDATE = "candidate"
     LEADER = "leader"
+
+
+class NotLeaderError(Exception):
+    """Raised when a command is submitted to a non-leader node."""
 
 
 class RaftNode:
@@ -48,11 +52,17 @@ class RaftNode:
         self.voted_for: str | None = None
         self.log: Log = Log()
 
-        # --- Volatile Raft state ---
+        # --- Volatile Raft state (all nodes) ---
         self.commit_index: int = 0
         self.last_applied: int = 0
         self.role: Role = Role.FOLLOWER
 
+        # --- Volatile Raft state (leader only, initialized on election) ---
+        self.next_index: dict[str, int] = {}
+        self.match_index: dict[str, int] = {}
+
+        # --- Internal bookkeeping ---
+        self._pending_futures: dict[int, asyncio.Future[Any]] = {}
         self._running: bool = False
         self._loop_task: Optional[asyncio.Task[None]] = None
 
@@ -75,6 +85,31 @@ class RaftNode:
         self._running = False
         if self._loop_task is not None:
             await self._loop_task
+
+    # ------------------------------------------------------------------
+    # Command submission (leader only)
+    # ------------------------------------------------------------------
+
+    async def submit(self, command: Any) -> Any:
+        """Submit a command to the replicated log.
+
+        Only the leader may accept commands.  Returns the state-machine
+        result once the entry has been committed by a majority.
+        """
+        if self.role != Role.LEADER:
+            raise NotLeaderError(f"{self.node_id} is not the leader")
+
+        entry = LogEntry(
+            term=self.current_term,
+            index=self.log.last_index + 1,
+            command=command,
+        )
+        self.log.append(entry)
+
+        future: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        self._pending_futures[entry.index] = future
+
+        return await future
 
     # ------------------------------------------------------------------
     # Internal main loop
@@ -123,6 +158,21 @@ class RaftNode:
         total_nodes = 1 + len(self.peer_ids)
         return (total_nodes // 2) + 1
 
+    def _apply_committed_entries(self) -> None:
+        """Apply all committed-but-not-yet-applied entries to the state machine.
+
+        On the leader, resolves any pending client futures with the
+        state-machine result.
+        """
+        while self.last_applied < self.commit_index:
+            self.last_applied += 1
+            entry = self.log.get(self.last_applied)
+            result = self.state_machine.apply(entry.command)
+
+            future = self._pending_futures.pop(self.last_applied, None)
+            if future is not None and not future.done():
+                future.set_result(result)
+
     # ------------------------------------------------------------------
     # Follower behavior
     # ------------------------------------------------------------------
@@ -162,28 +212,11 @@ class RaftNode:
 
         self._update_term_from_message(message)
 
+        # ---- AppendEntries (heartbeat or log replication) ----
         if isinstance(message, AppendEntries):
-            # Heartbeat or replication request from a leader.
-            if message.term < self.current_term:
-                # Leader is from an older term: reject.
-                response = AppendEntriesResponse(
-                    term=self.current_term,
-                    success=False,
-                    match_index=0,
-                    sender=self.node_id,
-                )
-                await self.transport.send(message.leader_id, response)
-                return False
+            return await self._handle_append_entries(message)
 
-            response = AppendEntriesResponse(
-                term=self.current_term,
-                success=True,
-                match_index=self.log.last_index,
-                sender=self.node_id,
-            )
-            await self.transport.send(message.leader_id, response)
-            return True
-
+        # ---- RequestVote ----
         if isinstance(message, RequestVote):
             # A follower grants its vote to a candidate only if **all** of:
             # 1) the candidate's term is at least as large as ours,
@@ -191,21 +224,20 @@ class RaftNode:
             # 3) the candidate's log is at least as up-to-date as our own log.
             vote_granted = False
 
-            if message.term < self.current_term:
-                vote_granted = False
-            else:
-                candidate_log_at_least_up_to_date_as_follower = (
+            if message.term >= self.current_term:
+                candidate_log_ok = (
                     message.last_log_term > self.log.last_term
                     or (
                         message.last_log_term == self.log.last_term
                         and message.last_log_index >= self.log.last_index
                     )
                 )
+                not_yet_voted = (
+                    self.voted_for is None
+                    or self.voted_for == message.candidate_id
+                )
 
-                if (
-                    candidate_log_at_least_up_to_date_as_follower
-                    and (self.voted_for is None or self.voted_for == message.candidate_id)
-                ):
+                if candidate_log_ok and not_yet_voted:
                     self.voted_for = message.candidate_id
                     vote_granted = True
 
@@ -219,7 +251,76 @@ class RaftNode:
 
         return False
 
+    async def _handle_append_entries(self, message: AppendEntries) -> bool:
+        """Process an AppendEntries RPC as a follower.
 
+        Implements the receiver logic from Figure 2 of the Raft paper.
+        Returns True if the election timer should be reset.
+        """
+        # Step 1: Reject if the leader's term is stale.
+        if message.term < self.current_term:
+            response = AppendEntriesResponse(
+                term=self.current_term,
+                success=False,
+                match_index=0,
+                sender=self.node_id,
+            )
+            await self.transport.send(message.leader_id, response)
+            return False
+
+        # Step 2: Check that our log contains an entry at prev_log_index
+        # with a term matching prev_log_term.
+        if message.prev_log_index > self.log.last_index:
+            response = AppendEntriesResponse(
+                term=self.current_term,
+                success=False,
+                match_index=self.log.last_index,
+                sender=self.node_id,
+            )
+            await self.transport.send(message.leader_id, response)
+            return True  # valid leader, reset election timer
+
+        if self.log.get(message.prev_log_index).term != message.prev_log_term:
+            response = AppendEntriesResponse(
+                term=self.current_term,
+                success=False,
+                match_index=0,
+                sender=self.node_id,
+            )
+            await self.transport.send(message.leader_id, response)
+            return True  # valid leader, reset election timer
+
+        # Step 3: Walk through new entries one by one.  If we have a
+        # conflicting entry (same index, different term), truncate from
+        # that point, then append the new entry.
+        insert_index = message.prev_log_index + 1
+        for entry in message.entries:
+            if insert_index <= self.log.last_index:
+                existing = self.log.get(insert_index)
+                if existing.term != entry.term:
+                    self.log.truncate_from(insert_index)
+                    self.log.append(entry)
+                # else: already have this entry, no action needed
+            else:
+                self.log.append(entry)
+            insert_index += 1
+
+        # Step 4: Advance commit_index based on leader's commit_index.
+        if message.leader_commit > self.commit_index:
+            self.commit_index = min(message.leader_commit, self.log.last_index)
+
+        # Step 5: Apply newly committed entries.
+        self._apply_committed_entries()
+
+        # Step 6: Respond with success.
+        response = AppendEntriesResponse(
+            term=self.current_term,
+            success=True,
+            match_index=self.log.last_index,
+            sender=self.node_id,
+        )
+        await self.transport.send(message.leader_id, response)
+        return True
 
     # ------------------------------------------------------------------
     # Candidate behavior
@@ -298,52 +399,109 @@ class RaftNode:
     # ------------------------------------------------------------------
 
     async def _run_leader_loop(self) -> None:
-        """Leader: send periodic heartbeats and watch for higher terms."""
+        """Leader: replicate log entries and maintain authority."""
+
+        # Initialize volatile leader state (Raft paper, Figure 2).
+        # next_index: optimistic — assume every peer is up to date.
+        # match_index: conservative — we don't know what they have yet.
+        for peer_id in self.peer_ids:
+            self.next_index[peer_id] = self.log.last_index + 1
+            self.match_index[peer_id] = 0
+
         while self._running and self.role == Role.LEADER:
-            await self._send_heartbeats()
+            await self._send_append_entries()
 
-            # After sending heartbeats, listen for messages for a short time.
-            try:
-                message = await asyncio.wait_for(
-                    self.transport.receive(self.node_id),
-                    timeout=self._heartbeat_interval_seconds,
-                )
-            except asyncio.TimeoutError:
-                # No messages; send another round of heartbeats.
-                continue
+            # Process messages until the next heartbeat is due.
+            deadline = asyncio.get_event_loop().time() + self._heartbeat_interval_seconds
 
-            self._update_term_from_message(message)
+            while self._running and self.role == Role.LEADER:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    break
 
-            if self.role == Role.FOLLOWER:
-                # Stepped down due to higher term.
-                return
+                try:
+                    message = await asyncio.wait_for(
+                        self.transport.receive(self.node_id),
+                        timeout=remaining,
+                    )
+                except asyncio.TimeoutError:
+                    break
 
-            # If we see an AppendEntries in the same term from a different
-            # leader, step down defensively.
-            if isinstance(message, AppendEntries) and message.term == self.current_term:
-                if message.leader_id != self.node_id:
-                    self.role = Role.FOLLOWER
+                self._update_term_from_message(message)
+                if self.role == Role.FOLLOWER:
                     return
 
-            if isinstance(message, RequestVote):
-                # As leader for this term, we should not grant new votes.
-                response = RequestVoteResponse(
-                    term=self.current_term,
-                    vote_granted=False,
-                    sender=self.node_id,
-                )
-                await self.transport.send(message.candidate_id, response)
+                if isinstance(message, AppendEntries) and message.term == self.current_term:
+                    if message.leader_id != self.node_id:
+                        self.role = Role.FOLLOWER
+                        return
 
-    async def _send_heartbeats(self) -> None:
-        """Send an AppendEntries heartbeat to all peers."""
+                if isinstance(message, AppendEntriesResponse):
+                    self._handle_append_entries_response(message)
+
+                if isinstance(message, RequestVote):
+                    response = RequestVoteResponse(
+                        term=self.current_term,
+                        vote_granted=False,
+                        sender=self.node_id,
+                    )
+                    await self.transport.send(message.candidate_id, response)
+
+            # Apply anything that was committed during this round.
+            self._apply_committed_entries()
+
+    async def _send_append_entries(self) -> None:
+        """Send AppendEntries RPCs to all peers.
+
+        For each peer, sends all log entries from next_index[peer]
+        onward (empty list acts as a heartbeat).
+        """
         for peer_id in self.peer_ids:
-            heartbeat = AppendEntries(
+            next_idx = self.next_index.get(peer_id, self.log.last_index + 1)
+            prev_log_index = next_idx - 1
+            prev_log_term = self.log.get(prev_log_index).term
+            entries = self.log.entries_from(next_idx)
+
+            message = AppendEntries(
                 term=self.current_term,
                 leader_id=self.node_id,
-                prev_log_index=self.log.last_index,
-                prev_log_term=self.log.last_term,
-                entries=[],
+                prev_log_index=prev_log_index,
+                prev_log_term=prev_log_term,
+                entries=entries,
                 leader_commit=self.commit_index,
                 sender=self.node_id,
             )
-            await self.transport.send(peer_id, heartbeat)
+            await self.transport.send(peer_id, message)
+
+    def _handle_append_entries_response(self, message: AppendEntriesResponse) -> None:
+        """Process a follower's response to our AppendEntries."""
+        peer_id = message.sender
+
+        if message.success:
+            self.next_index[peer_id] = message.match_index + 1
+            self.match_index[peer_id] = message.match_index
+            self._advance_commit_index()
+        else:
+            # Log inconsistency: back off by one and retry next round.
+            self.next_index[peer_id] = max(1, self.next_index[peer_id] - 1)
+
+    def _advance_commit_index(self) -> None:
+        """Check whether commit_index can advance (leader only).
+
+        Find the highest N where N > commit_index, a majority of
+        match_index[peer] >= N, and log[N].term == current_term.
+        The current_term check is critical — Raft leaders only commit
+        entries from their own term (§5.4.2).
+        """
+        for n in range(self.commit_index + 1, self.log.last_index + 1):
+            if self.log.get(n).term != self.current_term:
+                continue
+
+            # Count how many nodes have this entry (including self).
+            replication_count = 1
+            for peer_id in self.peer_ids:
+                if self.match_index.get(peer_id, 0) >= n:
+                    replication_count += 1
+
+            if replication_count >= self._majority():
+                self.commit_index = n

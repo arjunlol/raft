@@ -6,7 +6,7 @@ from raft.messages import (
     RequestVote,
     RequestVoteResponse,
 )
-from raft.node import RaftNode, Role
+from raft.node import NotLeaderError, RaftNode, Role
 from raft.state_machine import DictStateMachine, StateMachine
 from raft.transport import InMemoryTransport
 from raft.cluster import RaftCluster
@@ -19,6 +19,7 @@ __all__ = [
     "Message",
     "RequestVote",
     "RequestVoteResponse",
+    "NotLeaderError",
     "RaftNode",
     "Role",
     "DictStateMachine",
