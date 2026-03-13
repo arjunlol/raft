@@ -3,8 +3,11 @@ import asyncio
 import pytest
 
 from raft.cluster import RaftCluster
-from raft.node import Role
+from raft.log import LogEntry
+from raft.messages import AppendEntries, AppendEntriesResponse
+from raft.node import RaftNode, Role
 from raft.state_machine import DictStateMachine
+from raft.transport import InMemoryTransport
 
 
 async def wait_for_leader(cluster: RaftCluster, timeout: float = 3.0) -> str:
@@ -235,3 +238,62 @@ class TestReplication:
                 cluster.transport.reconnect(leader_id, nid)
 
         await cluster.stop()
+
+    async def test_heartbeat_does_not_commit_stale_entries(self) -> None:
+        """A follower with stale entries beyond what the leader sent must
+        not mark those entries as committed.
+        """
+        transport = InMemoryTransport()
+        transport.register("follower")
+        transport.register("leader")
+
+        follower = RaftNode(
+            "follower", ["leader"], transport, DictStateMachine(),
+        )
+        follower.current_term = 3
+
+        # Give the follower a committed entry at index 1 (term 2) …
+        follower.log.append(LogEntry(term=2, index=1, command=set_cmd("a", 1)))
+        # … and a stale uncommitted entry at index 2 from an old term
+        # that the current leader does NOT have.
+        follower.log.append(LogEntry(term=2, index=2, command=set_cmd("bad", 999)))
+
+        follower.commit_index = 0
+        follower.last_applied = 0
+
+        await follower.start()
+
+        # The leader sends a heartbeat (no entries) that covers only
+        # index 1.  prev_log_index=1 means "I verified you have index 1".
+        # leader_commit=1 means "index 1 is committed".
+        # Crucially, entries=[] — no new entries are sent.
+        heartbeat = AppendEntries(
+            term=3,
+            leader_id="leader",
+            prev_log_index=1,
+            prev_log_term=2,
+            entries=[],
+            leader_commit=1,
+            sender="leader",
+        )
+        await transport._node_queues_map["follower"].put(heartbeat)
+
+        # Wait for the follower to process the heartbeat.
+        response: AppendEntriesResponse = await asyncio.wait_for(
+            transport._node_queues_map["leader"].get(),
+            timeout=1.0,
+        )
+        assert response.success is True
+
+        # commit_index must be 1, NOT 2.  The leader only confirmed up
+        # to index 1 — the stale entry at index 2 must not be committed.
+        assert follower.commit_index == 1
+
+        sm = follower.state_machine
+        assert isinstance(sm, DictStateMachine)
+        assert sm.data.get("a") == 1
+        assert "bad" not in sm.data, (
+            "stale entry at index 2 must not be applied"
+        )
+
+        await follower.stop()

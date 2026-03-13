@@ -132,8 +132,7 @@ class RaftNode:
             elif self.role == Role.LEADER:
                 await self._run_leader_loop()
             else:
-                # Defensive: should never happen.
-                self.role = Role.FOLLOWER
+                raise AssertionError(f"unexpected role: {self.role}")
 
     # ------------------------------------------------------------------
     # Shared helpers
@@ -317,8 +316,9 @@ class RaftNode:
             insert_index += 1
 
         # Step 4: Advance commit_index based on leader's commit_index.
+        last_new_entry_index = message.prev_log_index + len(message.entries)
         if message.leader_commit > self.commit_index:
-            self.commit_index = min(message.leader_commit, self.log.last_index)
+            self.commit_index = min(message.leader_commit, last_new_entry_index)
 
         # Step 5: Apply newly committed entries.
         self._apply_committed_entries()
@@ -471,7 +471,7 @@ class RaftNode:
         onward (empty list acts as a heartbeat).
         """
         for peer_id in self.peer_ids:
-            next_idx = self.next_index.get(peer_id, self.log.last_index + 1)
+            next_idx = self.next_index[peer_id]
             prev_log_index = next_idx - 1
             prev_log_term = self.log.get(prev_log_index).term
             entries = self.log.entries_from(next_idx)
@@ -497,7 +497,7 @@ class RaftNode:
         peer_id = message.sender
 
         if message.success:
-            old_match = self.match_index.get(peer_id, 0)
+            old_match = self.match_index[peer_id]
             self.next_index[peer_id] = message.match_index + 1
             self.match_index[peer_id] = message.match_index
             if message.match_index > old_match:
@@ -513,21 +513,20 @@ class RaftNode:
     def _advance_commit_index(self) -> None:
         """Check whether commit_index can advance (leader only).
 
-        Find the highest N where N > commit_index, a majority of
-        match_index[peer] >= N, and log[N].term == current_term.
-        The current_term check is critical — Raft leaders only commit
-        entries from their own term (§5.4.2).
+        Find the highest index that's > commit_index, a majority of
+        match_index[peer] >=, and log[index].term == current_term.
         """
-        for n in range(self.commit_index + 1, self.log.last_index + 1):
-            if self.log.get(n).term != self.current_term:
+        for check_index in range(self.log.last_index, self.commit_index, -1):
+            if self.log.get(check_index).term != self.current_term:
                 continue
 
             # Count how many nodes have this entry (including self).
             replication_count = 1
             for peer_id in self.peer_ids:
-                if self.match_index.get(peer_id, 0) >= n:
+                if self.match_index[peer_id] >= check_index:
                     replication_count += 1
 
             if replication_count >= self._majority():
-                self.commit_index = n
-                self._logger.info(f"commit_index advanced to {n}")
+                self.commit_index = check_index
+                self._logger.info(f"commit_index advanced to {check_index}")
+                return
