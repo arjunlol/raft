@@ -12,6 +12,9 @@ class RaftCluster:
         self,
         node_ids: list[str],
         state_machine_factory: Callable[[], StateMachine] | None = None,
+        *,
+        election_timeout_range_seconds: tuple[float, float] = (0.15, 0.30),
+        heartbeat_interval_seconds: float = 0.05,
     ) -> None:
         self.transport = InMemoryTransport()
         self.node_map: dict[str, RaftNode] = {}
@@ -26,13 +29,16 @@ class RaftCluster:
         for node_id in node_ids:
             self.transport.register(node_id)
 
-            peer_ids = []
-            for nid in node_ids:
-                if nid != node_id:
-                    peer_ids.append(nid)
+            peer_ids = [nid for nid in node_ids if nid != node_id]
 
-            state_machine = state_machine_factory()
-            node = RaftNode(node_id, peer_ids, self.transport, state_machine)
+            node = RaftNode(
+                node_id,
+                peer_ids,
+                self.transport,
+                state_machine_factory(),
+                election_timeout_range_seconds=election_timeout_range_seconds,
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+            )
             self.node_map[node_id] = node
 
     async def start(self) -> None:

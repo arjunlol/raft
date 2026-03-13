@@ -1,97 +1,64 @@
-## Raft (sleep-consensus)
+## Raft Consensus
 
-Raft is a small, educational Raft consensus implementation in Python, built on `asyncio`.
-It focuses on clarity and close alignment with the original Raft paper terminology
-(`term`, `commit_index`, `AppendEntries`, etc.).
+A Raft consensus implementation in Python, built on `asyncio`. No external dependencies.
 
-This repository currently provides:
+The demo simulates a distributed feature flag store (like you'd use to gate rollouts of firmware features) where nodes must agree on flag state even through failures.
 
-- **Core data types**: `Log`, `LogEntry`, RPC message dataclasses
-- **In‑process transport**: `InMemoryTransport` using `asyncio.Queue`
-- **State machine**: a simple `DictStateMachine` for experiments and tests
-- **Cluster wiring**: `RaftCluster` to spin up multiple nodes in a single process
-
-Consensus logic (leader election, log replication, etc.) will be added incrementally
-in later commits; for now this is a clean, testable core.
-
----
-
-## Requirements
-
-- Python `>= 3.11` (the examples below assume a Unix-like shell)
-
----
-
-## Setup and installation
-
-From the project root:
+### Setup
 
 ```bash
-python3.12 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-You can use any supported Python 3.11+ interpreter; just replace `python3.12`
-with your preferred version.
-
----
-
-## Running the test suite
-
-After activating the virtual environment:
+### Tests
 
 ```bash
 pytest -v
 ```
 
-This runs the core tests, which currently cover:
+### Demo
 
-- Basic `Log` behavior (append, truncate, sentinel at index 0)
-- `DictStateMachine` operations (`set`, `get`, `delete`)
-- `RaftCluster` startup/shutdown behavior for a 3-node cluster
+```bash
+python demo.py
+```
 
----
+Boots a 3-node cluster with slow timeouts so you can watch elections and replication happen in real time. Walks through: leader election, flag replication, leader failure, re-election, and follower catch-up.
 
-## Running a simple in-process cluster
-
-There is no CLI yet; you use this library from your own Python code.
-Here is a minimal example that boots a 3-node cluster and keeps it running
-until you interrupt the process:
+### Usage
 
 ```python
 import asyncio
-
 from raft import RaftCluster
 
-
-async def main() -> None:
+async def main():
     cluster = RaftCluster(["node-0", "node-1", "node-2"])
     await cluster.start()
 
-    print("Cluster started with nodes:", list(cluster.nodes.keys()))
-    print("Press Ctrl+C to stop.")
+    # submit a command — routed to the leader, replicated to a majority
+    result = await cluster.submit({"op": "set", "key": "x", "value": 1})
 
-    try:
-        # In a real application you would interact with the nodes here:
-        # e.g. send client commands to a leader once leader election is implemented.
-        await asyncio.Event().wait()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        await cluster.stop()
+    value = cluster.read("x")  # 1
 
+    await cluster.stop()
 
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(main())
 ```
 
-Save this as `example_cluster.py` in the project root (next to `pyproject.toml`),
-activate your virtual environment, and run:
+### Architecture
 
-```bash
-python example_cluster.py
-```
+- `node.py` — core Raft node (election, replication, commitment)
+- `log.py` — append-only replicated log
+- `messages.py` — Raft RPC types (RequestVote, AppendEntries)
+- `transport.py` — in-memory message bus with partition simulation
+- `state_machine.py` — pluggable state machine interface (ships with a key-value store)
+- `cluster.py` — wires up a multi-node cluster
 
-As the Raft logic evolves, this example is a good place to experiment with
-client commands and state machine behavior.
+### What's implemented so far
+
+- Leader election with randomized timeouts
+- Log replication with consistency checks
+- Commitment via majority acknowledgment
+- Leader step-down on higher term
+- Follower catch-up after partition/restart

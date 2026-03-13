@@ -1,5 +1,6 @@
 import asyncio
 import enum
+import logging
 import random
 from typing import Any, Optional
 
@@ -46,6 +47,7 @@ class RaftNode:
         self.peer_ids = peer_ids
         self.transport = transport
         self.state_machine = state_machine
+        self._logger = logging.getLogger(f"raft.{node_id}")
 
         # --- Persistent Raft state ---
         self.current_term: int = 0
@@ -149,9 +151,12 @@ class RaftNode:
         current_term, clear voted_for, and step down to follower.
         """
         if message.term > self.current_term:
+            old_role = self.role
             self.current_term = message.term
             self.voted_for = None
             self.role = Role.FOLLOWER
+            if old_role != Role.FOLLOWER:
+                self._logger.info(f"became FOLLOWER (term={self.current_term})")
 
     def _majority(self) -> int:
         """Number of votes needed for a majority (including self)."""
@@ -168,6 +173,7 @@ class RaftNode:
             self.last_applied += 1
             entry = self.log.get(self.last_applied)
             result = self.state_machine.apply(entry.command)
+            self._logger.info(f"applied entry {self.last_applied} to state machine")
 
             future = self._pending_futures.pop(self.last_applied, None)
             if future is not None and not future.done():
@@ -240,6 +246,11 @@ class RaftNode:
                 if candidate_log_ok and not_yet_voted:
                     self.voted_for = message.candidate_id
                     vote_granted = True
+
+            if vote_granted:
+                self._logger.info(f"granted vote to {message.candidate_id} (term={self.current_term})")
+            else:
+                self._logger.info(f"rejected vote for {message.candidate_id} (term={message.term})")
 
             response = RequestVoteResponse(
                 term=self.current_term,
@@ -332,6 +343,7 @@ class RaftNode:
             # Start a new election.
             self.current_term += 1
             self.voted_for = self.node_id
+            self._logger.info(f"became CANDIDATE (term={self.current_term})")
             # Per Raft spec: count each peer's vote at most once (no duplicate votes).
             peers_that_granted_vote: set[str] = set()
 
@@ -355,6 +367,7 @@ class RaftNode:
                 if (1 + len(peers_that_granted_vote)) >= self._majority():
                     # We have a majority (self + distinct peers): become leader.
                     self.role = Role.LEADER
+                    self._logger.info(f"became LEADER (term={self.current_term})")
                     return
 
                 remaining = deadline - asyncio.get_event_loop().time()
@@ -380,7 +393,7 @@ class RaftNode:
                 # Step down if we see a valid leader in the same term.
                 if isinstance(message, AppendEntries) and message.term == self.current_term:
                     self.role = Role.FOLLOWER
-                    # Let follower loop handle subsequent messages.
+                    self._logger.info(f"became FOLLOWER (term={self.current_term})")
                     return
 
                 if isinstance(message, RequestVoteResponse):
@@ -433,6 +446,7 @@ class RaftNode:
 
                 if isinstance(message, AppendEntries) and message.term == self.current_term:
                     if message.leader_id != self.node_id:
+                        self._logger.info(f"became FOLLOWER (term={self.current_term})")
                         self.role = Role.FOLLOWER
                         return
 
@@ -473,17 +487,28 @@ class RaftNode:
             )
             await self.transport.send(peer_id, message)
 
+            if entries:
+                self._logger.info(f"replicated {len(entries)} entries to {peer_id} (next_index={next_idx})")
+            else:
+                self._logger.debug(f"heartbeat to {peer_id}")
+
     def _handle_append_entries_response(self, message: AppendEntriesResponse) -> None:
         """Process a follower's response to our AppendEntries."""
         peer_id = message.sender
 
         if message.success:
+            old_match = self.match_index.get(peer_id, 0)
             self.next_index[peer_id] = message.match_index + 1
             self.match_index[peer_id] = message.match_index
+            if message.match_index > old_match:
+                self._logger.info(f"{peer_id} accepted (match_index={message.match_index})")
+            else:
+                self._logger.debug(f"{peer_id} ack (match_index={message.match_index})")
             self._advance_commit_index()
         else:
             # Log inconsistency: back off by one and retry next round.
             self.next_index[peer_id] = max(1, self.next_index[peer_id] - 1)
+            self._logger.info(f"{peer_id} rejected (next_index backed off to {self.next_index[peer_id]})")
 
     def _advance_commit_index(self) -> None:
         """Check whether commit_index can advance (leader only).
@@ -505,3 +530,4 @@ class RaftNode:
 
             if replication_count >= self._majority():
                 self.commit_index = n
+                self._logger.info(f"commit_index advanced to {n}")
