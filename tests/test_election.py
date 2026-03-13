@@ -6,7 +6,9 @@ import pytest
 from raft.cluster import RaftCluster
 from raft.log import LogEntry
 from raft.messages import RequestVote, RequestVoteResponse
-from raft.node import Role
+from raft.node import RaftNode, Role
+from raft.state_machine import DictStateMachine
+from raft.transport import InMemoryTransport
 
 
 async def wait_for_leader(cluster: RaftCluster, timeout: float = 3.0) -> tuple[str, int]:
@@ -200,4 +202,69 @@ class TestElection:
         )
 
         await cluster.stop()
+
+    async def test_candidate_timeout_not_reset_by_stale_messages(self) -> None:
+        """Stale messages trickling in must not keep extending the candidate's election timeout."""
+        transport = InMemoryTransport()
+        for nid in ("n1", "n2", "n3"):
+            transport.register(nid)
+
+        node = RaftNode(
+            "n1", ["n2", "n3"], transport, DictStateMachine(),
+            election_timeout_range_seconds=(0.3, 0.3),
+        )
+        node.role = Role.CANDIDATE
+        await node.start()
+
+        # Drip-feed stale vote-denied responses every 100ms for well beyond the 300ms election timeout.
+        term_before = node.current_term
+        for _ in range(8):
+            await asyncio.sleep(0.10)
+            await transport._node_queues_map["n1"].put(
+                RequestVoteResponse(term=0, vote_granted=False, sender="n2")
+            )
+
+        await asyncio.sleep(0.15)
+
+        assert node.current_term > term_before + 1, (
+            "candidate should have timed out and started at least one new "
+            "election despite stale messages arriving"
+        )
+
+        await node.stop()
+
+    async def test_follower_not_kept_alive_by_rejected_votes(self) -> None:
+        """Rejected RequestVotes must not reset the follower's election timer."""
+        transport = InMemoryTransport()
+        for nid in ("n1", "n2", "n3"):
+            transport.register(nid)
+
+        node = RaftNode(
+            "n1", ["n2", "n3"], transport, DictStateMachine(),
+            election_timeout_range_seconds=(0.3, 0.3),
+        )
+        node.current_term = 5
+        node.voted_for = "n3"
+        await node.start()
+
+        # Spam n1 with RequestVote messages it will reject (stale term, already voted for someone else).
+        for _ in range(8):
+            await asyncio.sleep(0.10)
+            await transport._node_queues_map["n1"].put(
+                RequestVote(
+                    term=5,
+                    candidate_id="n2",
+                    last_log_index=0,
+                    last_log_term=0,
+                    sender="n2",
+                )
+            )
+
+        await asyncio.sleep(0.15)
+
+        assert node.role == Role.CANDIDATE, (
+            "follower should have timed out despite rejected RequestVote spam"
+        )
+
+        await node.stop()
 

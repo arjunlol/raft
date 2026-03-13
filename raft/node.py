@@ -131,21 +131,34 @@ class RaftNode:
         """Follower: wait for messages or election timeout."""
         while self._running and self.role == Role.FOLLOWER:
             timeout_seconds = self._new_election_timeout_seconds()
+            deadline = asyncio.get_event_loop().time() + timeout_seconds
 
-            try:
-                message = await asyncio.wait_for(
-                    self.transport.receive(self.node_id),
-                    timeout=timeout_seconds,
-                )
-            except asyncio.TimeoutError:
-                # Did not hear from a valid leader in time: start election.
-                self.role = Role.CANDIDATE
-                return
+            while self._running and self.role == Role.FOLLOWER:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    self.role = Role.CANDIDATE
+                    return
 
-            await self._handle_message_as_follower(message)
+                try:
+                    message = await asyncio.wait_for(
+                        self.transport.receive(self.node_id),
+                        timeout=remaining,
+                    )
+                except asyncio.TimeoutError:
+                    # Did not hear from a valid leader in time: start election.
+                    self.role = Role.CANDIDATE
+                    return
 
-    async def _handle_message_as_follower(self, message: Message) -> None:
-        """Handle a single incoming message while in follower role."""
+                should_reset_timer = await self._handle_message_as_follower(message)
+                if should_reset_timer:
+                    break  # break inner loop -> outer loop picks a fresh timeout
+
+    async def _handle_message_as_follower(self, message: Message) -> bool:
+        """Handle a single incoming message while in follower role.
+
+        Returns True if the election timer should be reset (valid
+        AppendEntries from current leader, or vote granted to a candidate).
+        """
 
         self._update_term_from_message(message)
 
@@ -160,10 +173,8 @@ class RaftNode:
                     sender=self.node_id,
                 )
                 await self.transport.send(message.leader_id, response)
-                return
+                return False
 
-            # Leader is from our current (or newer, already adopted) term:
-            # acknowledge and remain a follower.
             response = AppendEntriesResponse(
                 term=self.current_term,
                 success=True,
@@ -171,8 +182,7 @@ class RaftNode:
                 sender=self.node_id,
             )
             await self.transport.send(message.leader_id, response)
-            # Election timer is implicitly reset by looping again.
-            return
+            return True
 
         if isinstance(message, RequestVote):
             # A follower grants its vote to a candidate only if **all** of:
@@ -205,8 +215,9 @@ class RaftNode:
                 sender=self.node_id,
             )
             await self.transport.send(message.candidate_id, response)
-            # Election timer is effectively reset when we process this message.
-            return
+            return vote_granted
+
+        return False
 
 
 
@@ -237,6 +248,7 @@ class RaftNode:
 
             # Wait for responses or timeout.
             election_timeout_seconds = self._new_election_timeout_seconds()
+            deadline = asyncio.get_event_loop().time() + election_timeout_seconds
 
             while self._running and self.role == Role.CANDIDATE:
                 if (1 + len(peers_that_granted_vote)) >= self._majority():
@@ -244,10 +256,14 @@ class RaftNode:
                     self.role = Role.LEADER
                     return
 
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    break
+
                 try:
                     message = await asyncio.wait_for(
                         self.transport.receive(self.node_id),
-                        timeout=election_timeout_seconds,
+                        timeout=remaining,
                     )
                 except asyncio.TimeoutError:
                     # Election timed out without a winner: start a new election.
