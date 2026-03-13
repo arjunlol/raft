@@ -173,3 +173,31 @@ class TestElection:
 
         await cluster.stop()
 
+    async def test_candidate_does_not_count_duplicate_votes_from_same_peer(self) -> None:
+        """A candidate must count each peer's vote at most once; duplicate responses must not be counted."""
+        # 5 nodes -> majority = 3. So candidate needs self + 2 distinct peers to become leader.
+        cluster = RaftCluster(["n1", "n2", "n3", "n4", "n5"])
+        transport = cluster.transport
+
+        # Only n1 runs (candidate). It will increment to term 1 and send RequestVotes; we inject responses.
+        n1 = cluster.node_map["n1"]
+        n1.role = Role.CANDIDATE
+
+        await n1.start()
+
+        # Grant from n2 only, but send the same vote three times (duplicate/retry). Use term 1 to match the election.
+        for _ in range(3):
+            await transport._node_queues_map["n1"].put(
+                RequestVoteResponse(term=1, vote_granted=True, sender="n2")
+            )
+
+        # Give the candidate time to process all three messages.
+        await asyncio.sleep(0.5)
+
+        # With correct deduplication: n1 has 2 votes (self + n2) < majority 3 -> must not be leader.
+        assert n1.role != Role.LEADER, (
+            "candidate must not reach majority by counting the same peer's vote more than once"
+        )
+
+        await cluster.stop()
+

@@ -220,7 +220,8 @@ class RaftNode:
             # Start a new election.
             self.current_term += 1
             self.voted_for = self.node_id
-            votes_granted = 1  # self-vote
+            # Per Raft spec: count each peer's vote at most once (no duplicate votes).
+            peers_that_granted_vote: set[str] = set()
 
             # Send RequestVote RPCs to all peers.
             request = RequestVote(
@@ -238,8 +239,8 @@ class RaftNode:
             election_timeout_seconds = self._new_election_timeout_seconds()
 
             while self._running and self.role == Role.CANDIDATE:
-                if votes_granted >= self._majority():
-                    # We have a majority: become leader.
+                if (1 + len(peers_that_granted_vote)) >= self._majority():
+                    # We have a majority (self + distinct peers): become leader.
                     self.role = Role.LEADER
                     return
 
@@ -271,8 +272,8 @@ class RaftNode:
                     if message.term > self.current_term:
                         # Term rule already handled; we are follower now.
                         return
-                    if message.vote_granted:
-                        votes_granted += 1
+                    if message.vote_granted and message.sender not in peers_that_granted_vote:
+                        peers_that_granted_vote.add(message.sender)
 
                 # Other messages are ignored here.
 
